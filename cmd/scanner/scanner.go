@@ -166,8 +166,12 @@ func downloadModules(latest map[string]*Info, db *sql.DB) {
 			continue
 		}
 		mod.Readme = txt
-		db.Exec(`INSERT OR REPLACE INTO mods (path, version, readme, time) VALUES (?, ?, ?, ?)`,
+		_, err = db.Exec(`INSERT OR REPLACE INTO mods (path, version, readme, time) VALUES (?, ?, ?, ?)`,
 			mod.Path, mod.Version, mod.Readme, mod.Time)
+		if err != nil {
+			log.Printf("Failed to insert module %s into database: %v", mod.Path, err)
+			continue
+		}
 	}
 }
 
