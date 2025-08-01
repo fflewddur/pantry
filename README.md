@@ -27,6 +27,15 @@ Start the web server with the following command:
 go run cmd/server/server.go
 ```
 
+### Database
+
+The database holds relevant information about all of the modules we know
+about. The search engine indexes this information so that it can appropriately
+rank search results.
+
+I'm using sqlite during development, but this should eventually move to
+PostgreSQL.
+
 ### Search engine
 
 Todo. We'll use Sphinx Search to search and rank packages.
