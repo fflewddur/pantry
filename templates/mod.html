@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Module {{.Path}}</title>
+  </head>
+  <body>
+    <h1>{{.Path}}</h1>
+    <p>Version: {{.Version}}</p>
+    <p>Last Updated: {{.Time}}</p>
+    {{if .Readme}}
+    <h2>README</h2>
+    <pre>{{.Readme}}</pre>
+    {{else}}
+    <p>No README available.</p>
+    {{end}}
+    <form action="/search" method="get">
+      <label for="query">Search:</label>
+      <input type="text" id="query" name="q" required />
+    </form>
+  </body>
+</html>
