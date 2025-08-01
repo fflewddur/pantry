@@ -13,7 +13,7 @@ that it can be used by the search engine.
 Start the scanner with the following command:
 
 ```shell
-go run cmd/server/server.go
+go run cmd/scanner/scanner.go
 ```
 
 ### Server
@@ -24,7 +24,7 @@ found by the scanner.
 Start the web server with the following command:
 
 ```shell
-go run cmd/scanner/scanner.go
+go run cmd/server/server.go
 ```
 
 ### Search engine
