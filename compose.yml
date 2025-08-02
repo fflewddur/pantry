@@ -6,14 +6,42 @@ services:
     networks:
       - devnet
     ports:
-      - 26257:26257
-      - 8080:8080
+      - 127.0.0.1:26257:26257
     volumes:
       - roach:/cockroach/cockroach-data
     command: start-single-node --insecure
 
+  # sphinx:
+  #   image: macbre/sphinxsearch:3.8.1
+  #   container_name: sphinx
+  #   environment:
+  #     - SPHINX_CONFIG_FILE=/opt/sphinx/conf/sphinx.conf
+  #   hostname: search
+  #   networks:
+  #     - devnet
+  #   ports:
+  #     - "127.0.0.1:36307:36307" # bind to local interface only!
+  #   volumes:
+  #     - ./data:/opt/sphinx/indexes # directory where sphinx will store index data
+  #     - ./sphinx.conf:/opt/sphinx/conf/sphinx.conf # SphinxSE configuration file
+  #   mem_limit: 512m # match indexer.value from sphinx.conf
+
+  dev-search:
+    image: manticoresearch/manticore:latest
+    container_name: manticore
+    hostname: search
+    networks:
+      - devnet
+    ports:
+      - 127.0.0.1:9306:9306
+      - 127.0.0.1:9308:9308
+    volumes:
+      - manticore:/var/lib/manticore # directory where manticore will store index data
+      - ./manticore/etc/manticore.conf:/etc/manticoresearch/manticore.conf
+
 volumes:
   roach:
+  manticore:
 
 networks:
   devnet:
