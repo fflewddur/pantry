@@ -48,4 +48,19 @@ docker exec -it roach ./cockroach sql --insecure --database=pantry
 
 ### Search engine
 
-Todo. We'll use Sphinx Search to search and rank packages.
+The search engine processes user requests by identifying relevant packages and
+ranking them.
+
+The development search engine uses `docker compose` to run a local Manticore
+search instance. To start the search engine, run:
+
+```shell
+docker compose up -d
+```
+
+To re-index the search database (for example, after scanning new packages into
+the database), run:
+
+```shell
+docker exec -it --user manticore manticore indexer --all --rotate
+```
