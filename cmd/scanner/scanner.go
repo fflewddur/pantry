@@ -38,7 +38,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	defer db.Close(context.Background())
+	defer func() {
+		err = errors.Join(err, db.Close(context.Background()))
+	}()
 	c := http.Client{}
 
 	for len(modules) < maxModules {

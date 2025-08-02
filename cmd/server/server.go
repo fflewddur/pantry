@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -31,14 +32,9 @@ func NewServer() *Server {
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
-	defer db.Close(context.Background())
-	// _, err = db.Exec(`CREATE TABLE IF NOT EXISTS mods (
-	// 	id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-	// 	path TEXT NOT NULL UNIQUE,
-	// 	version TEXT NOT NULL,
-	// 	readme TEXT,
-	// 	time DATETIME NOT NULL
-	// );`)
+	defer func() {
+		err = errors.Join(err, db.Close(context.Background()))
+	}()
 	if err != nil {
 		log.Fatalf("Failed to create default database: %v", err)
 	}
