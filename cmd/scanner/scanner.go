@@ -31,7 +31,7 @@ type Module struct {
 func main() {
 	log.Println("Starting the scanner...")
 	modules := make(map[string]*ModuleEntry)
-	maxModules := 10000                   // Limit the number of modules to fetch
+	maxModules := 100                     // Limit the number of modules to fetch
 	since := time.Now().AddDate(-1, 0, 0) // Set the time to 1 year ago
 	urlBase := "https://index.golang.org/index"
 	db, err := initDB()
@@ -77,7 +77,7 @@ func main() {
 			if !found {
 				modules[entry.Path] = &entry
 			}
-			since = entry.Timestamp.Add(time.Nanosecond) // Add a nanosecond so we don't get the same entry again
+			since = entry.Timestamp
 		}
 		log.Printf("len(lines): %d, limit: %d, len(modules): %d, empty lines: %d", len(lines), limit, len(modules), emptyLines)
 		if (len(lines)-emptyLines) <= limit && limit <= 1 {
@@ -108,7 +108,8 @@ func initDB() (*pgx.Conn, error) {
 
 	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(context.Background(), `CREATE TABLE IF NOT EXISTS mods (
-		path TEXT NOT NULL PRIMARY KEY,
+		id INT64 DEFAULT unique_rowid(),
+		path TEXT NOT NULL UNIQUE,
 		version TEXT NOT NULL,
 		readme TEXT,
 		time TIMESTAMP);`)
@@ -164,6 +165,7 @@ func downloadModules(latest map[string]*Info, db *pgx.Conn) {
 	count := 0
 	for path, info := range latest {
 		count++
+		// TODO: If we already have the latest version of this module, don't download it again.
 		log.Printf("Downloading module %s (%d of %d)", path, count, len(latest))
 		url := fmt.Sprintf("https://proxy.golang.org/cached-only/%s/@v/%s.zip", path, info.Version)
 		resp, err := http.Get(url)

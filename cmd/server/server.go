@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
+	"os"
 	"time"
+
+	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
+	"github.com/jackc/pgx/v5"
 )
 
 func main() {
@@ -16,21 +22,23 @@ func main() {
 }
 
 type Server struct {
-	db *sql.DB
+	db *pgx.Conn
 }
 
 func NewServer() *Server {
-	db, err := sql.Open("sqlite", "file:./data/mods.db?mode=rw&_journal_mode=WAL&_busy_timeout=5000")
+	db, err := initDB()
+	// db, err := sql.Open("sqlite", "file:./data/mods.db?mode=rw&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS mods (
-		id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-		path TEXT NOT NULL UNIQUE,
-		version TEXT NOT NULL,
-		readme TEXT,
-		time DATETIME NOT NULL
-	);`)
+	defer db.Close(context.Background())
+	// _, err = db.Exec(`CREATE TABLE IF NOT EXISTS mods (
+	// 	id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+	// 	path TEXT NOT NULL UNIQUE,
+	// 	version TEXT NOT NULL,
+	// 	readme TEXT,
+	// 	time DATETIME NOT NULL
+	// );`)
 	if err != nil {
 		log.Fatalf("Failed to create default database: %v", err)
 	}
@@ -93,7 +101,7 @@ func (s *Server) modHandler(w http.ResponseWriter, r *http.Request) {
 	var version string
 	var readme sql.NullString
 	var t time.Time
-	err := s.db.QueryRow("SELECT version, time, readme FROM mods WHERE path = ?", path).Scan(&version, &t, &readme)
+	err := s.db.QueryRow(context.Background(), "SELECT version, time, readme FROM mods WHERE path = ?", path).Scan(&version, &t, &readme)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			log.Printf("Module %s not found", path)
@@ -130,4 +138,38 @@ type ModPageData struct {
 	Version string
 	Readme  string
 	Time    time.Time
+}
+
+func initDB() (*pgx.Conn, error) {
+	log.Println("Initializing database connection...")
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgresql://pantry:whatever@localhost:26257/pantry"
+	}
+	log.Printf("Using DATABASE_URL: %s", dbURL)
+	config, err := pgx.ParseConfig(dbURL)
+	if err != nil {
+		log.Fatalf("Failed to parse DATABASE_URL: %v", err)
+	}
+	conn, err := pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), `CREATE TABLE IF NOT EXISTS mods (
+		path TEXT NOT NULL PRIMARY KEY,
+		version TEXT NOT NULL,
+		readme TEXT,
+		time TIMESTAMP);`)
+		if err != nil {
+			return fmt.Errorf("failed to create table: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+	log.Println("Database initialized successfully.")
+	return conn, nil
 }

@@ -33,8 +33,18 @@ The database holds relevant information about all of the modules we know
 about. The search engine indexes this information so that it can appropriately
 rank search results.
 
-I'm using sqlite during development, but this should eventually move to
-PostgreSQL.
+The development database uses `docker compose` to run a local CockroachDB
+instance. To start the database server, run:
+
+```shell
+docker compose up -d
+```
+
+To connect to the database console, run:
+
+```shell
+docker exec -it roach ./cockroach sql --insecure --database=pantry
+```
 
 ### Search engine
 
