@@ -40,6 +40,14 @@ instance. To start the database server, run:
 docker compose up -d
 ```
 
+TODO: Create initial database and user
+
+```shell
+docker exec -it roach ./cockroach sql --insecure
+CREATE DATABASE pantry;
+CREATE USER pantry;
+```
+
 To connect to the database console, run:
 
 ```shell

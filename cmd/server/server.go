@@ -44,7 +44,6 @@ func NewServer() *Server {
 
 func (s *Server) Start() {
 	searchCfg := search.NewConfiguration()
-	searchCfg.Servers[0].URL = "http://127.0.0.1:9308"
 	s.searcher = search.NewAPIClient(searchCfg)
 	http.HandleFunc("/", s.rootHandler)
 	http.HandleFunc("/search", s.searchHandler)
@@ -70,23 +69,23 @@ func (s *Server) rootHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Received request for search results")
-	q := r.URL.Query().Get("@readme log")
+	q := r.URL.Query().Get("q")
 	searchResults := &SearchResults{
 		Query: q,
 	}
 
-	// TODO: Implement actual search logic here
 	searchReq := search.NewSearchRequest("mods")
 	query := search.NewSearchQuery()
 	query.SetQueryString(q)
 	searchReq.SetQuery(*query)
 	searchResp, httpResp, err := s.searcher.SearchAPI.Search(context.Background()).SearchRequest(*searchReq).Execute()
 	if err != nil {
-		log.Printf("Error executing search: %v, HTTP response: %v", err, httpResp)
+		log.Printf("Error executing search: %v, HTTP response: %v, searchResp: %v", err, httpResp, searchResp)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	log.Printf("Search results: %v", searchResp)
+	// TODO: Process searchResp to populate searchResults
 
 	tmpl, err := template.New("results.html").ParseFiles("templates/results.html")
 	if err != nil {

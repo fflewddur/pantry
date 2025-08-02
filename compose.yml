@@ -31,22 +31,35 @@ services:
       - dev-db
     image: manticoresearch/manticore:latest
     container_name: manticore
+    environment:
+      - EXTRA=1
     hostname: search
+      # restart: always
     networks:
       - devnet
     ports:
       - 127.0.0.1:9306:9306
       - 127.0.0.1:9308:9308
       - 127.0.0.1:9312:9312
+    ulimits:
+      nproc: 65535
+      nofile:
+         soft: 65535
+         hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     volumes:
       - manticore:/var/lib/manticore # directory where manticore will store index data
-      - ./manticore/etc/manticore.conf:/etc/manticoresearch/manticore.conf
-    command: searchd --config /etc/manticoresearch/manticore.conf --logdebugv --console
+      - manticore:/var/log/manticore # directory where manticore will store log files
+      - manticore-etc:/etc/manticoresearch # directory where manticore will store configuration files
     mem_limit: 512m # match indexer.value from manticore.conf
+    user: manticore
 
 volumes:
   roach:
   manticore:
+  manticore-etc:
 
 networks:
   devnet:

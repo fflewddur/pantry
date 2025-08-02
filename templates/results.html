@@ -9,7 +9,7 @@
     <h1>Results for {{.Query}}</h1>
     <form action="/search" method="get">
       <label for="query">Search:</label>
-      <input type="text" id="query" name="q" required />
+      <input type="text" id="query" name="q" value="{{.Query}}" required />
     </form>
   </body>
 </html>
