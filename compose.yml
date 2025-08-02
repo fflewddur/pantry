@@ -1,0 +1,20 @@
+services:
+  dev-db:
+    image: cockroachdb/cockroach:latest-v25.2
+    container_name: roach
+    hostname: db
+    networks:
+      - devnet
+    ports:
+      - 26257:26257
+      - 8080:8080
+    volumes:
+      - roach:/cockroach/cockroach-data
+    command: start-single-node --insecure
+
+volumes:
+  roach:
+
+networks:
+  devnet:
+    driver: bridge

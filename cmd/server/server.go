@@ -6,8 +6,6 @@ import (
 	"log"
 	"net/http"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 func main() {

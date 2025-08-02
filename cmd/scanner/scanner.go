@@ -3,18 +3,21 @@ package main
 import (
 	"archive/zip"
 	"bytes"
-	"database/sql"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
-	_ "modernc.org/sqlite"
+	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
+	"github.com/jackc/pgx/v5"
 )
 
 type Module struct {
@@ -28,32 +31,21 @@ type Module struct {
 func main() {
 	log.Println("Starting the scanner...")
 	modules := make(map[string]*ModuleEntry)
-	gotResults := true
-	maxModules := 10                      // Limit the number of modules to fetch
-	since := time.Now().AddDate(0, 0, -1) // Set the time to 1 day ago
+	maxModules := 10000                   // Limit the number of modules to fetch
+	since := time.Now().AddDate(-1, 0, 0) // Set the time to 1 year ago
 	urlBase := "https://index.golang.org/index"
-	// Initialize the database connection
-	var db *sql.DB
-	db, err := sql.Open("sqlite", "file:./data/mods.db?mode=rw&_journal_mode=WAL&_busy_timeout=5000")
+	db, err := initDB()
 	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
+		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS mods (
-		id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-		path TEXT NOT NULL UNIQUE,
-		version TEXT NOT NULL,
-		readme TEXT,
-		time DATETIME NOT NULL
-	);`)
-	if err != nil {
-		log.Fatalf("Failed to create table: %v", err)
-	}
+	defer db.Close(context.Background())
 	c := http.Client{}
 
-	for gotResults && len(modules) < maxModules {
+	for len(modules) < maxModules {
+		limit := min(2000, maxModules-len(modules))
+		url := fmt.Sprintf("%s?since=%s&limit=%d", urlBase, since.Format(time.RFC3339), limit)
 		log.Printf("Fetching modules since %s (%d of %d)", since.Format(time.RFC3339), len(modules), maxModules)
-
-		url := fmt.Sprintf("%s?since=%s&limit=%d", urlBase, since.Format(time.RFC3339), maxModules-len(modules))
+		log.Printf("Requesting URL: %s", url)
 		resp, err := c.Get(url)
 		if err != nil {
 			log.Fatalf("Failed to make request: %v", err)
@@ -68,12 +60,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to read response body: %v", err)
 		}
-		count := 0
-		for line := range bytes.SplitSeq(data, []byte("\n")) {
+		log.Printf("Bytes received: %s", string(data))
+		lines := bytes.Split(data, []byte("\n"))
+		emptyLines := 0
+		for _, line := range lines {
 			if len(line) == 0 {
+				emptyLines++
 				continue // Skip empty lines
 			}
-			count++
 			var entry ModuleEntry
 			if err := json.Unmarshal(line, &entry); err != nil {
 				log.Printf("Error unmarshaling response for line %s: %v", line, err)
@@ -83,17 +77,51 @@ func main() {
 			if !found {
 				modules[entry.Path] = &entry
 			}
-			since = entry.Timestamp
+			since = entry.Timestamp.Add(time.Nanosecond) // Add a nanosecond so we don't get the same entry again
 		}
-		if count <= 1 {
-			gotResults = false // No more data to process
-			log.Println("No more results to process, stopping the scanner.")
-			continue
+		log.Printf("len(lines): %d, limit: %d, len(modules): %d, empty lines: %d", len(lines), limit, len(modules), emptyLines)
+		if (len(lines)-emptyLines) <= limit && limit <= 1 {
+			log.Printf("Received %d modules, which is less than the limit of %d. Stopping.", len(lines), limit)
+			break // Stop if we received fewer modules than requested
 		}
 	}
 	latest := fetchLatest(modules)
 	downloadModules(latest, db)
 	log.Printf("Processed %d modules since %s", len(modules), since.Format(time.RFC3339))
+}
+
+func initDB() (*pgx.Conn, error) {
+	log.Println("Initializing database connection...")
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgresql://pantry:whatever@localhost:26257/pantry"
+	}
+	log.Printf("Using DATABASE_URL: %s", dbURL)
+	config, err := pgx.ParseConfig(dbURL)
+	if err != nil {
+		log.Fatalf("Failed to parse DATABASE_URL: %v", err)
+	}
+	conn, err := pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), `CREATE TABLE IF NOT EXISTS mods (
+		path TEXT NOT NULL PRIMARY KEY,
+		version TEXT NOT NULL,
+		readme TEXT,
+		time TIMESTAMP);`)
+		if err != nil {
+			return fmt.Errorf("failed to create table: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+	log.Println("Database initialized successfully.")
+	return conn, nil
 }
 
 func fetchLatest(modules map[string]*ModuleEntry) map[string]*Info {
@@ -132,7 +160,7 @@ func fetchLatest(modules map[string]*ModuleEntry) map[string]*Info {
 	return latest
 }
 
-func downloadModules(latest map[string]*Info, db *sql.DB) {
+func downloadModules(latest map[string]*Info, db *pgx.Conn) {
 	count := 0
 	for path, info := range latest {
 		count++
@@ -166,12 +194,23 @@ func downloadModules(latest map[string]*Info, db *sql.DB) {
 			continue
 		}
 		mod.Readme = txt
-		_, err = db.Exec(`INSERT OR REPLACE INTO mods (path, version, readme, time) VALUES (?, ?, ?, ?)`,
-			mod.Path, mod.Version, mod.Readme, mod.Time)
+		err = crdbpgx.ExecuteTx(context.Background(), db, pgx.TxOptions{}, func(tx pgx.Tx) error {
+			_, err := tx.Exec(context.Background(), `INSERT INTO mods (path, version, readme, time) VALUES ($1, $2, $3, $4) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, time = $4 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Time)
+			if err != nil {
+				return fmt.Errorf("failed to insert row (%v): %w", mod, err)
+			}
+			return nil
+		})
+		log.Printf("length of mod.Readme: %d", len(mod.Readme))
 		if err != nil {
-			log.Printf("Failed to insert module %s into database: %v", mod.Path, err)
-			continue
+			log.Fatalf("Failed to insert row: %v", err)
 		}
+		// _, err = db.Exec(`INSERT OR REPLACE INTO mods (path, version, readme, time) VALUES (?, ?, ?, ?)`,
+		// 	mod.Path, mod.Version, mod.Readme, mod.Time)
+		// if err != nil {
+		// 	log.Printf("Failed to insert module %s into database: %v", mod.Path, err)
+		// 	continue
+		// }
 	}
 }
 
@@ -202,6 +241,10 @@ func extractContent(data []byte) (string, error) {
 		content, err := io.ReadAll(rc)
 		if err != nil {
 			log.Printf("Failed to read content of file %s: %v", file.Name, err)
+			continue
+		}
+		if !utf8.Valid(content) {
+			log.Printf("File %s is not valid UTF-8, skipping", file.Name)
 			continue
 		}
 		readmeContents.Write(content)
