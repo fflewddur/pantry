@@ -13,6 +13,7 @@ import (
 
 	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
 	"github.com/jackc/pgx/v5"
+	search "github.com/manticoresoftware/manticoresearch-go"
 )
 
 func main() {
@@ -23,12 +24,12 @@ func main() {
 }
 
 type Server struct {
-	db *pgx.Conn
+	db       *pgx.Conn
+	searcher *search.APIClient
 }
 
 func NewServer() *Server {
 	db, err := initDB()
-	// db, err := sql.Open("sqlite", "file:./data/mods.db?mode=rw&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
@@ -42,6 +43,9 @@ func NewServer() *Server {
 }
 
 func (s *Server) Start() {
+	searchCfg := search.NewConfiguration()
+	searchCfg.Servers[0].URL = "http://127.0.0.1:9308"
+	s.searcher = search.NewAPIClient(searchCfg)
 	http.HandleFunc("/", s.rootHandler)
 	http.HandleFunc("/search", s.searchHandler)
 	http.HandleFunc("/mod/", s.modHandler)
@@ -66,12 +70,23 @@ func (s *Server) rootHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Received request for search results")
-	q := r.URL.Query().Get("q")
+	q := r.URL.Query().Get("@readme log")
 	searchResults := &SearchResults{
 		Query: q,
 	}
 
 	// TODO: Implement actual search logic here
+	searchReq := search.NewSearchRequest("mods")
+	query := search.NewSearchQuery()
+	query.SetQueryString(q)
+	searchReq.SetQuery(*query)
+	searchResp, httpResp, err := s.searcher.SearchAPI.Search(context.Background()).SearchRequest(*searchReq).Execute()
+	if err != nil {
+		log.Printf("Error executing search: %v, HTTP response: %v", err, httpResp)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("Search results: %v", searchResp)
 
 	tmpl, err := template.New("results.html").ParseFiles("templates/results.html")
 	if err != nil {

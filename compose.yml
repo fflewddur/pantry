@@ -27,6 +27,8 @@ services:
   #   mem_limit: 512m # match indexer.value from sphinx.conf
 
   dev-search:
+    depends_on:
+      - dev-db
     image: manticoresearch/manticore:latest
     container_name: manticore
     hostname: search
@@ -35,9 +37,12 @@ services:
     ports:
       - 127.0.0.1:9306:9306
       - 127.0.0.1:9308:9308
+      - 127.0.0.1:9312:9312
     volumes:
       - manticore:/var/lib/manticore # directory where manticore will store index data
       - ./manticore/etc/manticore.conf:/etc/manticoresearch/manticore.conf
+    command: searchd --config /etc/manticoresearch/manticore.conf --logdebugv --console
+    mem_limit: 512m # match indexer.value from manticore.conf
 
 volumes:
   roach:
