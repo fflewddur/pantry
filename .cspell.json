@@ -16,11 +16,15 @@
         "macbre",
         "manticore",
         "manticoresearch",
+        "manticoresoftware",
+        "memlock",
         "modernc",
+        "nofile",
         "pgsql",
         "searchd",
         "sphinxsearch",
-        "tmpl"
+        "tmpl",
+        "ulimits"
     ],
     "ignoreWords": [],
     "import": []

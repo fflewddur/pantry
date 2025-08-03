@@ -12,7 +12,7 @@
       <input type="text" id="query" name="q" value="{{.Query}}" required />
     </form>
     <h2>Results</h2>
-    <ul>
+    <ol>
       {{range .Results}}
       <li>
         <a href="/mod/{{.Path}}">{{.Path}}</a> - Version: {{.Version}}
@@ -28,6 +28,7 @@
         {{end}}
       </li>
       {{end}}
+    </ol>
     {{if .Warnings}}
     <h2>Warning</h2>
     <p style="color: red">Search completed with warnings.</p>
