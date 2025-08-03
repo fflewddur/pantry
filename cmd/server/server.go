@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	log.Println("The server is starting...")
+	log.Println("Starting the server...")
 	server := NewServer()
 	server.Start()
 	log.Println("Server started on :8080")
@@ -74,6 +74,7 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		Query: q,
 	}
 	searchReq := search.NewSearchRequest("mods")
+	searchReq.SetLimit(10)
 	query := search.NewSearchQuery()
 	query.SetQueryString(q)
 	searchReq.SetQuery(*query)
