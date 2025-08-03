@@ -28,11 +28,35 @@ type Module struct {
 	Time    time.Time
 }
 
-func main() {
-	log.Println("Starting the scanner...")
+type Scanner struct {
+	db         *pgx.Conn
+	httpClient *http.Client
+}
+
+func NewScanner() *Scanner {
+	log.Println("Initializing scanner...")
+	db, err := initDB()
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	return &Scanner{
+		db:         db,
+		httpClient: &http.Client{},
+	}
+}
+
+func (s *Scanner) Start() {
+	defer func() {
+		log.Printf("Closing database connection (from defer)")
+		err := s.db.Close(context.Background())
+		if err != nil {
+			log.Printf("Error closing database connection: %v", err)
+		}
+	}()
+
 	modules := make(map[string]*ModuleEntry)
 	maxModules := 10000                   // Limit the number of modules to fetch
-	since := time.Now().AddDate(-1, 0, 0) // Set the time to 1 year ago
+	since := time.Now().AddDate(-2, 0, 0) // Set the time to 1 year ago
 	urlBase := "https://index.golang.org/index"
 	db, err := initDB()
 	if err != nil {
@@ -41,14 +65,13 @@ func main() {
 	defer func() {
 		err = errors.Join(err, db.Close(context.Background()))
 	}()
-	c := http.Client{}
 
 	for len(modules) < maxModules {
-		limit := min(2000, maxModules-len(modules))
+		limit := 2000
 		url := fmt.Sprintf("%s?since=%s&limit=%d", urlBase, since.Format(time.RFC3339), limit)
 		log.Printf("Fetching modules since %s (%d of %d)", since.Format(time.RFC3339), len(modules), maxModules)
 		log.Printf("Requesting URL: %s", url)
-		resp, err := c.Get(url)
+		resp, err := s.httpClient.Get(url)
 		if err != nil {
 			log.Fatalf("Failed to make request: %v", err)
 		}
@@ -62,10 +85,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to read response body: %v", err)
 		}
-		log.Printf("Bytes received: %s", string(data))
+		// log.Printf("Bytes received: %s", string(data))
 		lines := bytes.Split(data, []byte("\n"))
 		emptyLines := 0
 		for _, line := range lines {
+			if len(modules) >= maxModules {
+				log.Printf("Reached maximum number of modules (%d). Stopping.", maxModules)
+				break // Stop if we reached the maximum number of modules
+			}
 			if len(line) == 0 {
 				emptyLines++
 				continue // Skip empty lines
@@ -81,15 +108,23 @@ func main() {
 			}
 			since = entry.Timestamp
 		}
-		log.Printf("len(lines): %d, limit: %d, len(modules): %d, empty lines: %d", len(lines), limit, len(modules), emptyLines)
-		if (len(lines)-emptyLines) <= limit && limit <= 1 {
-			log.Printf("Received %d modules, which is less than the limit of %d. Stopping.", len(lines), limit)
+		// log.Printf("len(lines): %d, limit: %d, len(modules): %d, empty lines: %d", len(lines), limit, len(modules), emptyLines)
+		if (len(lines) - emptyLines) < limit {
+			log.Printf("Received %d modules, which is less than the limit of %d. Stopping.", len(lines)-emptyLines, limit)
 			break // Stop if we received fewer modules than requested
 		}
 	}
 	latest := fetchLatest(modules)
-	downloadModules(latest, db)
+	s.downloadModules(latest)
 	log.Printf("Processed %d modules since %s", len(modules), since.Format(time.RFC3339))
+}
+
+func main() {
+	log.Println("Starting the scanner...")
+	scanner := NewScanner()
+	scanner.Start()
+	log.Println("Scanner finished.")
+	os.Exit(0) // Exit with success code
 }
 
 func initDB() (*pgx.Conn, error) {
@@ -163,12 +198,16 @@ func fetchLatest(modules map[string]*ModuleEntry) map[string]*Info {
 	return latest
 }
 
-func downloadModules(latest map[string]*Info, db *pgx.Conn) {
+func (s *Scanner) downloadModules(latest map[string]*Info) {
 	count := 0
 	for path, info := range latest {
 		count++
 		// TODO: If we already have the latest version of this module, don't download it again.
 		log.Printf("Downloading module %s (%d of %d)", path, count, len(latest))
+		if info.Version == s.latestSeenVersion(path) {
+			log.Printf("Skipping module %s, already at latest version %s", path, info.Version)
+			continue
+		}
 		url := fmt.Sprintf("https://proxy.golang.org/cached-only/%s/@v/%s.zip", path, info.Version)
 		resp, err := http.Get(url)
 		if err != nil {
@@ -198,7 +237,7 @@ func downloadModules(latest map[string]*Info, db *pgx.Conn) {
 			continue
 		}
 		mod.Readme = txt
-		err = crdbpgx.ExecuteTx(context.Background(), db, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		err = crdbpgx.ExecuteTx(context.Background(), s.db, pgx.TxOptions{}, func(tx pgx.Tx) error {
 			_, err := tx.Exec(context.Background(), `INSERT INTO mods (path, version, readme, time) VALUES ($1, $2, $3, $4) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, time = $4 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Time)
 			if err != nil {
 				return fmt.Errorf("failed to insert row (%v): %w", mod, err)
@@ -216,6 +255,15 @@ func downloadModules(latest map[string]*Info, db *pgx.Conn) {
 		// 	continue
 		// }
 	}
+}
+
+func (s *Scanner) latestSeenVersion(path string) string {
+	var version string
+	err := s.db.QueryRow(context.Background(), "SELECT version FROM mods WHERE path LIKE $1", path).Scan(&version)
+	if err != nil {
+		return ""
+	}
+	return version
 }
 
 func extractContent(data []byte) (string, error) {
