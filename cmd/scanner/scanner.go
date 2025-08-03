@@ -55,8 +55,9 @@ func (s *Scanner) Start() {
 	}()
 
 	modules := make(map[string]*ModuleEntry)
-	maxModules := 10000                   // Limit the number of modules to fetch
-	since := time.Now().AddDate(-2, 0, 0) // Set the time to 1 year ago
+	maxModules := 10000 // Limit the number of modules to fetch
+	// since := time.Now().AddDate(-2, 0, 0) // Set the time to 1 year ago
+	since := s.getMostRecentFetchTime()
 	urlBase := "https://index.golang.org/index"
 	db, err := initDB()
 	if err != nil {
@@ -69,7 +70,7 @@ func (s *Scanner) Start() {
 	for len(modules) < maxModules {
 		limit := 2000
 		url := fmt.Sprintf("%s?since=%s&limit=%d", urlBase, since.Format(time.RFC3339), limit)
-		log.Printf("Fetching modules since %s (%d of %d)", since.Format(time.RFC3339), len(modules), maxModules)
+		// log.Printf("Fetching modules since %s (%d of %d)", since.Format(time.RFC3339), len(modules), maxModules)
 		log.Printf("Requesting URL: %s", url)
 		resp, err := s.httpClient.Get(url)
 		if err != nil {
@@ -108,6 +109,13 @@ func (s *Scanner) Start() {
 			}
 			since = entry.Timestamp
 		}
+
+		_, err = s.db.Exec(context.Background(), `INSERT INTO utils (key, value) VALUES ('since', $1) ON 
+		CONFLICT (key) DO UPDATE SET value = $1 WHERE excluded.key LIKE 'since';`, since.Format(time.RFC3339))
+		if err != nil {
+			log.Printf("Error updating 'since' in database: %v", err)
+		}
+
 		// log.Printf("len(lines): %d, limit: %d, len(modules): %d, empty lines: %d", len(lines), limit, len(modules), emptyLines)
 		if (len(lines) - emptyLines) < limit {
 			log.Printf("Received %d modules, which is less than the limit of %d. Stopping.", len(lines)-emptyLines, limit)
@@ -116,7 +124,29 @@ func (s *Scanner) Start() {
 	}
 	latest := fetchLatest(modules)
 	s.downloadModules(latest)
-	log.Printf("Processed %d modules since %s", len(modules), since.Format(time.RFC3339))
+	log.Printf("Processed %d modules up to %s", len(modules), since.Format(time.RFC3339))
+}
+
+func (s *Scanner) getMostRecentFetchTime() time.Time {
+	var t time.Time
+	var str string
+	err := s.db.QueryRow(context.Background(), `SELECT value FROM utils WHERE key LIKE "since"`).Scan(&str)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			log.Println("No modules found in the database. Starting from 0.")
+			return time.Time{}
+		}
+		log.Printf("Error querying latest fetch time: %v", err)
+		return time.Time{} // Return zero time if there's an error
+	}
+
+	log.Printf("Most recent fetch time: %s", str)
+	t, err = time.Parse(time.RFC3339, str)
+	if err != nil {
+		log.Printf("Error parsing time from database: %v", err)
+		return time.Time{} // Return zero time if parsing fails
+	}
+	return t
 }
 
 func main() {
@@ -150,6 +180,18 @@ func initDB() (*pgx.Conn, error) {
 		version TEXT NOT NULL,
 		readme TEXT,
 		time TIMESTAMP);`)
+		if err != nil {
+			return fmt.Errorf("failed to create table: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), `CREATE TABLE IF NOT EXISTS utils (
+		key STRING NOT NULL PRIMARY KEY,
+		value STRING);`)
 		if err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
 		}
@@ -202,7 +244,6 @@ func (s *Scanner) downloadModules(latest map[string]*Info) {
 	count := 0
 	for path, info := range latest {
 		count++
-		// TODO: If we already have the latest version of this module, don't download it again.
 		log.Printf("Downloading module %s (%d of %d)", path, count, len(latest))
 		if info.Version == s.latestSeenVersion(path) {
 			log.Printf("Skipping module %s, already at latest version %s", path, info.Version)
@@ -240,7 +281,7 @@ func (s *Scanner) downloadModules(latest map[string]*Info) {
 		err = crdbpgx.ExecuteTx(context.Background(), s.db, pgx.TxOptions{}, func(tx pgx.Tx) error {
 			_, err := tx.Exec(context.Background(), `INSERT INTO mods (path, version, readme, time) VALUES ($1, $2, $3, $4) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, time = $4 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Time)
 			if err != nil {
-				return fmt.Errorf("failed to insert row (%v): %w", mod, err)
+				fmt.Printf("failed to insert row (%v): %v", mod, err)
 			}
 			return nil
 		})
@@ -248,12 +289,6 @@ func (s *Scanner) downloadModules(latest map[string]*Info) {
 		if err != nil {
 			log.Fatalf("Failed to insert row: %v", err)
 		}
-		// _, err = db.Exec(`INSERT OR REPLACE INTO mods (path, version, readme, time) VALUES (?, ?, ?, ?)`,
-		// 	mod.Path, mod.Version, mod.Readme, mod.Time)
-		// if err != nil {
-		// 	log.Printf("Failed to insert module %s into database: %v", mod.Path, err)
-		// 	continue
-		// }
 	}
 }
 
@@ -281,7 +316,7 @@ func extractContent(data []byte) (string, error) {
 			continue
 		}
 		foundReadme = true
-		log.Printf("Extracting file: %s (compressed size: %d, uncompressed size: %d)", file.Name, file.CompressedSize64, file.UncompressedSize64)
+		// log.Printf("Extracting file: %s (compressed size: %d, uncompressed size: %d)", file.Name, file.CompressedSize64, file.UncompressedSize64)
 		rc, err := file.Open()
 		if err != nil {
 			log.Printf("Failed to open file %s in zip: %v", file.Name, err)
@@ -305,11 +340,11 @@ func extractContent(data []byte) (string, error) {
 	}
 	if !foundReadme {
 		log.Printf("No README files found in the zip archive:")
-		for _, file := range reader.File {
-			log.Printf("  - %s (compressed size: %d, uncompressed size: %d)", file.Name, file.CompressedSize64, file.UncompressedSize64)
-		}
+		// for _, file := range reader.File {
+		// 	log.Printf("  - %s (compressed size: %d, uncompressed size: %d)", file.Name, file.CompressedSize64, file.UncompressedSize64)
+		// }
 	}
-	log.Println("Finished extracting content from zip file.")
+	// log.Println("Finished extracting content from zip file.")
 	return readmeContents.String(), nil
 }
 
