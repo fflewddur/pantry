@@ -32,3 +32,4 @@ go.work.sum
 .vscode/
 
 data/mods.db
+manticore/data/*
