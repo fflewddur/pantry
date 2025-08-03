@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -33,16 +32,17 @@ func NewServer() *Server {
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
-	defer func() {
-		err = errors.Join(err, db.Close(context.Background()))
-	}()
-	if err != nil {
-		log.Fatalf("Failed to create default database: %v", err)
-	}
 	return &Server{db: db}
 }
 
 func (s *Server) Start() {
+	defer func() {
+		log.Printf("Closing database connection (from defer)")
+		err := s.db.Close(context.Background())
+		if err != nil {
+			log.Printf("Error closing database connection: %v", err)
+		}
+	}()
 	searchCfg := search.NewConfiguration()
 	s.searcher = search.NewAPIClient(searchCfg)
 	http.HandleFunc("/", s.rootHandler)
@@ -73,7 +73,6 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	searchResults := &SearchResults{
 		Query: q,
 	}
-
 	searchReq := search.NewSearchRequest("mods")
 	query := search.NewSearchQuery()
 	query.SetQueryString(q)
@@ -89,16 +88,8 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 	hits, ok := searchResp.GetHitsOk()
 	if ok {
 		log.Printf("Search hits: %d", len(hits.Hits))
-		s.db, err = initDB()
-		if err != nil {
-			log.Printf("Failed to open database: %v", err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
 		for _, hit := range hits.Hits {
-			// fields := hit.GetFields()
-			log.Printf("Hit ID=%v", *hit.Id)
-
+			log.Printf("Hit ID=%v, score=%v", *hit.Id, *hit.Score)
 			var path, version string
 			var readme sql.NullString
 			var t time.Time
@@ -119,6 +110,7 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 				Version: version,
 				Readme:  readme.String,
 				Time:    t,
+				Score:   *hit.Score,
 			})
 		}
 	}
@@ -156,6 +148,7 @@ type Module struct {
 	Version string
 	Readme  string
 	Time    time.Time
+	Score   int32
 }
 
 func (s *Server) modHandler(w http.ResponseWriter, r *http.Request) {
@@ -164,7 +157,7 @@ func (s *Server) modHandler(w http.ResponseWriter, r *http.Request) {
 	var version string
 	var readme sql.NullString
 	var t time.Time
-	err := s.db.QueryRow(context.Background(), "SELECT version, time, readme FROM mods WHERE path = ?", path).Scan(&version, &t, &readme)
+	err := s.db.QueryRow(context.Background(), "SELECT version, time, readme FROM mods WHERE path = $1", path).Scan(&version, &t, &readme)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			log.Printf("Module %s not found", path)

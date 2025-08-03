@@ -31,7 +31,7 @@ type Module struct {
 func main() {
 	log.Println("Starting the scanner...")
 	modules := make(map[string]*ModuleEntry)
-	maxModules := 100                     // Limit the number of modules to fetch
+	maxModules := 10000                   // Limit the number of modules to fetch
 	since := time.Now().AddDate(-1, 0, 0) // Set the time to 1 year ago
 	urlBase := "https://index.golang.org/index"
 	db, err := initDB()
