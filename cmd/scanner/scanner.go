@@ -130,7 +130,7 @@ func (s *Scanner) Start() {
 func (s *Scanner) getMostRecentFetchTime() time.Time {
 	var t time.Time
 	var str string
-	err := s.db.QueryRow(context.Background(), `SELECT value FROM utils WHERE key LIKE "since"`).Scan(&str)
+	err := s.db.QueryRow(context.Background(), `SELECT value FROM utils WHERE key LIKE 'since'`).Scan(&str)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			log.Println("No modules found in the database. Starting from 0.")
@@ -285,8 +285,8 @@ func (s *Scanner) downloadModules(latest map[string]*Info) {
 			}
 			return nil
 		})
-		log.Printf("length of mod.Readme: %d", len(mod.Readme))
 		if err != nil {
+			log.Printf("length of mod.Readme: %d", len(mod.Readme))
 			log.Fatalf("Failed to insert row: %v", err)
 		}
 	}
