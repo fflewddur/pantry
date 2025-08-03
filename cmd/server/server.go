@@ -85,7 +85,49 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Search results: %v", searchResp)
-	// TODO: Process searchResp to populate searchResults
+	searchResults.Results = make([]*Module, 0, len(searchResp.Hits.Hits))
+	hits, ok := searchResp.GetHitsOk()
+	if ok {
+		log.Printf("Search hits: %d", len(hits.Hits))
+		s.db, err = initDB()
+		if err != nil {
+			log.Printf("Failed to open database: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		for _, hit := range hits.Hits {
+			// fields := hit.GetFields()
+			log.Printf("Hit ID=%v", *hit.Id)
+
+			var path, version string
+			var readme sql.NullString
+			var t time.Time
+			err := s.db.QueryRow(context.Background(), "SELECT path, version, readme, time FROM mods WHERE id = $1", *hit.Id).Scan(&path, &version, &readme, &t)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					log.Printf("Module with ID %d not found in database", *hit.Id)
+					continue
+				}
+				log.Printf("Error querying database for module ID %d: %v", *hit.Id, err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+			log.Printf("Module found: path=%s, version=%s, readme=%v, time=%s", path, version, readme, t.Format(time.RFC3339))
+			searchResults.Results = append(searchResults.Results, &Module{
+				Id:      *hit.Id,
+				Path:    path,
+				Version: version,
+				Readme:  readme.String,
+				Time:    t,
+			})
+		}
+	}
+	searchResults.Took = searchResp.GetTook()
+	warnings, ok := searchResp.GetWarningOk()
+	if ok {
+		log.Printf("Search warning: %v", warnings)
+		searchResults.Warnings = true
+	}
 
 	tmpl, err := template.New("results.html").ParseFiles("templates/results.html")
 	if err != nil {
@@ -102,7 +144,18 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type SearchResults struct {
-	Query string
+	Query    string
+	Took     int32
+	Warnings bool
+	Results  []*Module
+}
+
+type Module struct {
+	Id      uint64
+	Path    string
+	Version string
+	Readme  string
+	Time    time.Time
 }
 
 func (s *Server) modHandler(w http.ResponseWriter, r *http.Request) {
