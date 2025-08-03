@@ -8,7 +8,7 @@ services:
     ports:
       - 127.0.0.1:26257:26257
     volumes:
-      - roach:/cockroach/cockroach-data
+      - roach:/cockroach/cockroach-data:z
     command: start-single-node --insecure
 
   # sphinx:
@@ -32,7 +32,7 @@ services:
     image: manticoresearch/manticore:latest
     container_name: manticore
     environment:
-      - EXTRA=1
+      - EXTRA=1 # TODO: figure out what this var does
     hostname: search
     networks:
       - devnet
@@ -49,11 +49,10 @@ services:
         soft: -1
         hard: -1
     volumes:
-      - manticore:/var/lib/manticore # directory where manticore will store index data
-      - manticore:/var/log/manticore # directory where manticore will store log files
-      # - manticore-etc:/etc/manticoresearch # directory where manticore will store configuration files
-      - ./manticore/etc/manticore.conf:/etc/manticoresearch/manticore.conf # Manticore configuration file
-    mem_limit: 512m # match indexer.value from manticore.conf
+      - manticore:/var/lib/manticore:z # directory where manticore will store index data
+      - manticore:/var/log/manticore:z # directory where manticore will store log files
+      - ./manticore/etc/manticore.conf:/etc/manticoresearch/manticore.conf:z # Manticore configuration file
+    mem_limit: 512m # TODO: match indexer.value from manticore.conf
     user: manticore
 
 volumes:
