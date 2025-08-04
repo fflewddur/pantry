@@ -31,7 +31,11 @@ type Module struct {
 type Scanner struct {
 	db         *pgx.Conn
 	httpClient *http.Client
+	modPaths   chan string
+	toFetch    chan *Module
 }
+
+const modIndexLimit = 2000
 
 func NewScanner() *Scanner {
 	log.Println("Initializing scanner...")
@@ -39,37 +43,88 @@ func NewScanner() *Scanner {
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
+
 	return &Scanner{
 		db:         db,
 		httpClient: &http.Client{},
+		modPaths:   make(chan string, 100),
+		toFetch:    make(chan *Module, 100),
 	}
 }
 
 func (s *Scanner) Start() {
 	defer func() {
-		log.Printf("Closing database connection (from defer)")
 		err := s.db.Close(context.Background())
 		if err != nil {
 			log.Printf("Error closing database connection: %v", err)
 		}
 	}()
 
-	modules := make(map[string]*ModuleEntry)
-	maxModules := 10000 // Limit the number of modules to fetch
-	// since := time.Now().AddDate(-2, 0, 0) // Set the time to 1 year ago
-	since := s.getMostRecentFetchTime()
-	urlBase := "https://index.golang.org/index"
-	db, err := initDB()
-	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
-	}
-	defer func() {
-		err = errors.Join(err, db.Close(context.Background()))
+	counter := 0
+	maxModules := 5000 // Limit the number of modules to fetch
+
+	// Start up workers
+	go func() {
+		// Watch for modules paths and determine if we should download the latest version of each
+		conn, err := initDB()
+		if err != nil {
+			log.Fatalf("Failed to initialize database connection: %v", err)
+		}
+		defer func() {
+			err = errors.Join(err, conn.Close(context.Background()))
+		}()
+		seen := make(map[string]bool)
+		for path := range s.modPaths {
+			log.Printf("Processing module path: %s", path)
+			if seen[path] {
+				continue // Skip if we've already seen this path
+			}
+			seen[path] = true
+			vSeen := latestSeenVersion(path, conn) // Check the latest version for this module path
+			info, err := getLatestModInfo(path)
+			if err != nil {
+				log.Printf("Error fetching latest version for %s: %v", path, err)
+				continue // Skip this module if we can't fetch the latest version
+			}
+			if info.Version == vSeen {
+				log.Printf("Module %s is already at the latest version %s, skipping.", path, info.Version)
+				continue // Skip if the latest version is already seen
+			}
+			mod := &Module{
+				Path:    path,
+				Version: info.Version,
+				Time:    info.Time,
+			}
+			s.toFetch <- mod
+		}
 	}()
 
-	for len(modules) < maxModules {
-		limit := 2000
-		url := fmt.Sprintf("%s?since=%s&limit=%d", urlBase, since.Format(time.RFC3339), limit)
+	go func() {
+		// Watch for modules to fetch and download them
+		conn, err := initDB()
+		if err != nil {
+			log.Fatalf("Failed to initialize database connection: %v", err)
+		}
+		defer func() {
+			err = errors.Join(err, conn.Close(context.Background()))
+		}()
+		for mod := range s.toFetch {
+			err := downloadModule(mod, conn)
+			if err != nil {
+				log.Printf("Error downloading module %s: %v", mod.Path, err)
+				continue // Skip this module if we can't download it
+			}
+			log.Printf("Successfully parsed module %s version %s (%d of %d)", mod.Path, mod.Version, counter, maxModules)
+			counter++
+		}
+	}()
+
+	// modules := make(map[string]*ModuleEntry)
+	since := s.getMostRecentFetchTime()
+	urlBase := "https://index.golang.org/index"
+
+	for counter < maxModules {
+		url := fmt.Sprintf("%s?since=%s&limit=%d", urlBase, since.Format(time.RFC3339), modIndexLimit)
 		// log.Printf("Fetching modules since %s (%d of %d)", since.Format(time.RFC3339), len(modules), maxModules)
 		log.Printf("Requesting URL: %s", url)
 		resp, err := s.httpClient.Get(url)
@@ -90,8 +145,8 @@ func (s *Scanner) Start() {
 		lines := bytes.Split(data, []byte("\n"))
 		emptyLines := 0
 		for _, line := range lines {
-			if len(modules) >= maxModules {
-				log.Printf("Reached maximum number of modules (%d). Stopping.", maxModules)
+			if counter >= maxModules {
+				log.Printf("Reached maximum number of modules (%d). Stopping.", counter)
 				break // Stop if we reached the maximum number of modules
 			}
 			if len(line) == 0 {
@@ -101,12 +156,9 @@ func (s *Scanner) Start() {
 			var entry ModuleEntry
 			if err := json.Unmarshal(line, &entry); err != nil {
 				log.Printf("Error unmarshaling response for line %s: %v", line, err)
-				continue
+				continue // Skip errors when unmarshaling
 			}
-			_, found := modules[entry.Path]
-			if !found {
-				modules[entry.Path] = &entry
-			}
+			s.modPaths <- entry.Path
 			since = entry.Timestamp
 		}
 
@@ -117,14 +169,12 @@ func (s *Scanner) Start() {
 		}
 
 		// log.Printf("len(lines): %d, limit: %d, len(modules): %d, empty lines: %d", len(lines), limit, len(modules), emptyLines)
-		if (len(lines) - emptyLines) < limit {
-			log.Printf("Received %d modules, which is less than the limit of %d. Stopping.", len(lines)-emptyLines, limit)
+		if (len(lines) - emptyLines) < modIndexLimit {
+			log.Printf("Received %d modules, which is less than the limit of %d. Stopping.", len(lines)-emptyLines, modIndexLimit)
 			break // Stop if we received fewer modules than requested
 		}
 	}
-	latest := fetchLatest(modules)
-	s.downloadModules(latest)
-	log.Printf("Processed %d modules up to %s", len(modules), since.Format(time.RFC3339))
+	log.Printf("Processed %d modules up to %s", counter, since.Format(time.RFC3339))
 }
 
 func (s *Scanner) getMostRecentFetchTime() time.Time {
@@ -158,12 +208,10 @@ func main() {
 }
 
 func initDB() (*pgx.Conn, error) {
-	log.Println("Initializing database connection...")
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		dbURL = "postgresql://pantry:whatever@localhost:26257/pantry"
 	}
-	log.Printf("Using DATABASE_URL: %s", dbURL)
 	config, err := pgx.ParseConfig(dbURL)
 	if err != nil {
 		log.Fatalf("Failed to parse DATABASE_URL: %v", err)
@@ -200,101 +248,67 @@ func initDB() (*pgx.Conn, error) {
 	if err != nil {
 		log.Fatalf("Failed to create table: %v", err)
 	}
-	log.Println("Database initialized successfully.")
 	return conn, nil
 }
 
-func fetchLatest(modules map[string]*ModuleEntry) map[string]*Info {
-	// https://proxy.golang.org/cached-only/github.com/fflewddur/bsky/@latest
-	count := 0
-	latest := make(map[string]*Info, len(modules))
-	for _, mod := range modules {
-		count++
-		log.Printf("Fetching latest version for module: %s (%d of %d)", mod.Path, count, len(modules))
-		url := fmt.Sprintf("https://proxy.golang.org/cached-only/%s/@latest", mod.Path)
-		resp, err := http.Get(url)
-		if err != nil {
-			log.Printf("Failed to fetch latest version for %s: %v", mod.Path, err)
-			continue
-		}
-		defer func() {
-			err = errors.Join(err, resp.Body.Close())
-		}()
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("Unexpected status code for %s: %d", mod.Path, resp.StatusCode)
-			continue
-		}
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("Failed to read response body for %s: %v", mod.Path, err)
-			continue
-		}
-		var info Info
-		if err := json.Unmarshal(data, &info); err != nil {
-			log.Printf("Error unmarshaling response for %s: %v", mod.Path, err)
-			continue
-		}
-		latest[mod.Path] = &info
-		// log.Printf("Latest version for module %s is %s at %s", mod.Path, info.Version, info.Time.Format(time.RFC3339))
+func getLatestModInfo(path string) (*Info, error) {
+	url := fmt.Sprintf("https://proxy.golang.org/cached-only/%s/@latest", path)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch latest version for %s: %w", path, err)
 	}
-	return latest
+	defer func() {
+		err = errors.Join(err, resp.Body.Close())
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code for %s: %d", path, resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body for %s: %w", path, err)
+	}
+	var info Info
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("error unmarshaling response for %s: %w", path, err)
+	}
+	return &info, nil
 }
 
-func (s *Scanner) downloadModules(latest map[string]*Info) {
-	count := 0
-	for path, info := range latest {
-		count++
-		log.Printf("Downloading module %s (%d of %d)", path, count, len(latest))
-		if info.Version == s.latestSeenVersion(path) {
-			log.Printf("Skipping module %s, already at latest version %s", path, info.Version)
-			continue
-		}
-		url := fmt.Sprintf("https://proxy.golang.org/cached-only/%s/@v/%s.zip", path, info.Version)
-		resp, err := http.Get(url)
-		if err != nil {
-			log.Printf("Failed to download module %s: %v", path, err)
-			continue
-		}
-		defer func() {
-			err = errors.Join(err, resp.Body.Close())
-		}()
-		if resp.StatusCode != http.StatusOK {
-			log.Printf("Unexpected status code for %s: %d", path, resp.StatusCode)
-			continue
-		}
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Printf("Failed to read response body for %s: %v", path, err)
-			continue
-		}
-		mod := &Module{
-			Path:    path,
-			Version: info.Version,
-			Time:    info.Time,
-		}
-		txt, err := extractContent(data)
-		if err != nil {
-			log.Printf("Failed to extract content for %s: %v", path, err)
-			continue
-		}
-		mod.Readme = txt
-		err = crdbpgx.ExecuteTx(context.Background(), s.db, pgx.TxOptions{}, func(tx pgx.Tx) error {
-			_, err := tx.Exec(context.Background(), `INSERT INTO mods (path, version, readme, time) VALUES ($1, $2, $3, $4) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, time = $4 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Time)
-			if err != nil {
-				fmt.Printf("failed to insert row (%v): %v", mod, err)
-			}
-			return nil
-		})
-		if err != nil {
-			log.Printf("length of mod.Readme: %d", len(mod.Readme))
-			log.Fatalf("Failed to insert row: %v", err)
-		}
+func downloadModule(mod *Module, conn *pgx.Conn) error {
+	url := fmt.Sprintf("https://proxy.golang.org/cached-only/%s/@v/%s.zip", mod.Path, mod.Version)
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to download module %s: %w", mod.Path, err)
 	}
+	defer func() {
+		err = errors.Join(err, resp.Body.Close())
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code for %s: %d", mod.Path, resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body for %s: %w", mod.Path, err)
+	}
+	txt, err := extractContent(data)
+	if err != nil {
+		return fmt.Errorf("failed to extract content for %s: %w", mod.Path, err)
+	}
+	mod.Readme = txt
+	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), `INSERT INTO mods (path, version, readme, time) VALUES ($1, $2, $3, $4) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, time = $4 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Time)
+		return err
+	})
+	if err != nil {
+		log.Printf("length of mod.Readme: %d", len(mod.Readme))
+		return fmt.Errorf("failed to insert module %s into database: %w", mod.Path, err)
+	}
+	return nil
 }
 
-func (s *Scanner) latestSeenVersion(path string) string {
+func latestSeenVersion(path string, conn *pgx.Conn) string {
 	var version string
-	err := s.db.QueryRow(context.Background(), "SELECT version FROM mods WHERE path LIKE $1", path).Scan(&version)
+	err := conn.QueryRow(context.Background(), "SELECT version FROM mods WHERE path LIKE $1", path).Scan(&version)
 	if err != nil {
 		return ""
 	}
@@ -308,15 +322,12 @@ func extractContent(data []byte) (string, error) {
 	}
 	// Create a regexp to match README files
 	readmeRegex := regexp.MustCompile(`(?i)readme(\.md|\.txt)?$`)
-	foundReadme := false
 	readmeContents := strings.Builder{}
 	for _, file := range reader.File {
 		// Just look at the README files
 		if !readmeRegex.MatchString(file.Name) {
 			continue
 		}
-		foundReadme = true
-		// log.Printf("Extracting file: %s (compressed size: %d, uncompressed size: %d)", file.Name, file.CompressedSize64, file.UncompressedSize64)
 		rc, err := file.Open()
 		if err != nil {
 			log.Printf("Failed to open file %s in zip: %v", file.Name, err)
@@ -336,15 +347,7 @@ func extractContent(data []byte) (string, error) {
 		}
 		readmeContents.Write(content)
 		readmeContents.WriteByte('\n') // Add a newline for separation
-		// log.Printf("Content of %s: %s\n", file.Name, content) // For demonstration purposes
 	}
-	if !foundReadme {
-		log.Printf("No README files found in the zip archive:")
-		// for _, file := range reader.File {
-		// 	log.Printf("  - %s (compressed size: %d, uncompressed size: %d)", file.Name, file.CompressedSize64, file.UncompressedSize64)
-		// }
-	}
-	// log.Println("Finished extracting content from zip file.")
 	return readmeContents.String(), nil
 }
 
