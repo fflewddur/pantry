@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -36,9 +37,10 @@ type Scanner struct {
 	modPaths   chan string
 	toFetch    chan *Module
 	lFmt       *message.Printer // For localized messages
+	scratchDir string           // Temporary directory for downloaded modules
 }
 
-const modIndexLimit = 2000
+const modIndexLimit = 500
 
 func NewScanner() *Scanner {
 	log.Println("Initializing scanner...")
@@ -46,13 +48,17 @@ func NewScanner() *Scanner {
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-
+	scratchDir := os.Getenv("PANTRY_SCRATCH")
+	if scratchDir == "" {
+		scratchDir = filepath.Join(os.TempDir(), "pantry")
+	}
 	return &Scanner{
 		db:         db,
 		httpClient: &http.Client{},
 		modPaths:   make(chan string, 100),
 		toFetch:    make(chan *Module, 100),
 		lFmt:       message.NewPrinter(language.Make(os.Getenv("LANG"))),
+		scratchDir: scratchDir,
 	}
 }
 
@@ -63,7 +69,16 @@ func (s *Scanner) Start() {
 			log.Printf("Error closing database connection: %v", err)
 		}
 	}()
-
+	err := os.MkdirAll(s.scratchDir, os.ModePerm) // Ensure the scratch directory exists
+	if err != nil {
+		log.Fatalf("Failed to create scratch directory %s: %v", s.scratchDir, err)
+	}
+	defer func() {
+		err = errors.Join(err, os.RemoveAll(s.scratchDir)) // Clean up the scratch directory after processing
+		if err != nil {
+			log.Printf("Failed to remove scratch directory %s: %v", s.scratchDir, err)
+		}
+	}()
 	counter := 0
 	maxModules := 10_000 // Limit the number of modules to fetch
 
@@ -113,7 +128,7 @@ func (s *Scanner) Start() {
 			err = errors.Join(err, conn.Close(context.Background()))
 		}()
 		for mod := range s.toFetch {
-			err := downloadModule(mod, conn)
+			err := s.downloadModule(mod, conn)
 			if err != nil {
 				log.Printf("Error downloading module %s: %v", mod.Path, err)
 				continue // Skip this module if we can't download it
@@ -281,7 +296,7 @@ func getLatestModInfo(path string) (*Info, error) {
 	return &info, nil
 }
 
-func downloadModule(mod *Module, conn *pgx.Conn) error {
+func (s *Scanner) downloadModule(mod *Module, conn *pgx.Conn) error {
 	url := fmt.Sprintf("https://proxy.golang.org/cached-only/%s/@v/%s.zip", mod.Path, mod.Version)
 	resp, err := http.Get(url)
 	if err != nil {
@@ -297,7 +312,7 @@ func downloadModule(mod *Module, conn *pgx.Conn) error {
 	if err != nil {
 		return fmt.Errorf("failed to read response body for %s: %w", mod.Path, err)
 	}
-	txt, err := extractContent(data)
+	txt, err := s.extractContent(data) // This function also unzips the module to /tmp
 	if err != nil {
 		return fmt.Errorf("failed to extract content for %s: %w", mod.Path, err)
 	}
@@ -322,19 +337,48 @@ func latestSeenVersion(path string, conn *pgx.Conn) string {
 	return version
 }
 
-func extractContent(data []byte) (string, error) {
+func (s *Scanner) extractContent(data []byte) (string, error) {
+	// Create a regexp to match README files
+	readmeRegex := regexp.MustCompile(`(?i)readme(\.md|\.txt)?$`)
+	readmeContents := strings.Builder{}
 	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return "", fmt.Errorf("failed to create zip reader: %w", err)
 	}
-	// Create a regexp to match README files
-	readmeRegex := regexp.MustCompile(`(?i)readme(\.md|\.txt)?$`)
-	readmeContents := strings.Builder{}
+	tmpDir, err := os.MkdirTemp(s.scratchDir, "mod-")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary directory: %w", err)
+	}
+	defer func() {
+		err = errors.Join(err, os.RemoveAll(tmpDir)) // Clean up the temporary directory after processing
+		if err != nil {
+			log.Printf("Failed to remove temporary directory %s: %v", tmpDir, err)
+		}
+	}()
+
 	for _, file := range reader.File {
-		// Just look at the README files
-		if !readmeRegex.MatchString(file.Name) {
+		path := filepath.Join(tmpDir, file.Name)
+		log.Printf("Processing file: %s", path)
+		if !strings.HasPrefix(path, filepath.Clean(tmpDir)+string(os.PathSeparator)) {
+			fmt.Println("invalid file path")
 			continue
 		}
+		if file.FileInfo().IsDir() {
+			fmt.Println("creating directory...")
+			err := os.MkdirAll(path, os.ModePerm)
+			if err != nil {
+				log.Printf("Failed to create directory %s: %v", path, err)
+				continue
+			}
+		} else {
+			dirPath := filepath.Dir(path)
+			err := os.MkdirAll(dirPath, os.ModePerm)
+			if err != nil {
+				log.Printf("Failed to create directory %s: %v", dirPath, err)
+				continue
+			}
+		}
+
 		rc, err := file.Open()
 		if err != nil {
 			log.Printf("Failed to open file %s in zip: %v", file.Name, err)
@@ -343,17 +387,37 @@ func extractContent(data []byte) (string, error) {
 		defer func() {
 			err = errors.Join(err, rc.Close())
 		}()
-		content, err := io.ReadAll(rc)
+
+		dstFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
 		if err != nil {
-			log.Printf("Failed to read content of file %s: %v", file.Name, err)
+			log.Printf("Failed to create file %s: %v", file.Name, err)
 			continue
 		}
-		if !utf8.Valid(content) {
-			log.Printf("File %s is not valid UTF-8, skipping", file.Name)
+		defer func() {
+			err = errors.Join(err, dstFile.Close())
+		}()
+
+		_, err = io.Copy(dstFile, rc)
+		if err != nil {
+			log.Printf("Failed to copy content of file %s: %v", file.Name, err)
 			continue
 		}
-		readmeContents.Write(content)
-		readmeContents.WriteByte('\n') // Add a newline for separation
+
+		// Build a single string with all README contents
+		if readmeRegex.MatchString(file.Name) {
+			content, err := io.ReadAll(rc)
+			if err != nil {
+				log.Printf("Failed to read content of file %s: %v", file.Name, err)
+				continue
+			}
+			if !utf8.Valid(content) {
+				log.Printf("File %s is not valid UTF-8, skipping", file.Name)
+				continue
+			}
+
+			readmeContents.Write(content)
+			readmeContents.WriteByte('\n') // Add a newline for separation
+		}
 	}
 	return readmeContents.String(), nil
 }
