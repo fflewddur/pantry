@@ -18,6 +18,8 @@ import (
 
 	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 )
 
 type Module struct {
@@ -33,6 +35,7 @@ type Scanner struct {
 	httpClient *http.Client
 	modPaths   chan string
 	toFetch    chan *Module
+	lFmt       *message.Printer // For localized messages
 }
 
 const modIndexLimit = 2000
@@ -49,6 +52,7 @@ func NewScanner() *Scanner {
 		httpClient: &http.Client{},
 		modPaths:   make(chan string, 100),
 		toFetch:    make(chan *Module, 100),
+		lFmt:       message.NewPrinter(language.Make(os.Getenv("LANG"))),
 	}
 }
 
@@ -61,7 +65,7 @@ func (s *Scanner) Start() {
 	}()
 
 	counter := 0
-	maxModules := 5000 // Limit the number of modules to fetch
+	maxModules := 10_000 // Limit the number of modules to fetch
 
 	// Start up workers
 	go func() {
@@ -114,7 +118,8 @@ func (s *Scanner) Start() {
 				log.Printf("Error downloading module %s: %v", mod.Path, err)
 				continue // Skip this module if we can't download it
 			}
-			log.Printf("Successfully parsed module %s version %s (%d of %d)", mod.Path, mod.Version, counter, maxModules)
+			m := s.lFmt.Sprintf("Successfully parsed module %s version %s (%d of %d)", mod.Path, mod.Version, counter, maxModules)
+			log.Print(m)
 			counter++
 		}
 	}()
@@ -146,7 +151,8 @@ func (s *Scanner) Start() {
 		emptyLines := 0
 		for _, line := range lines {
 			if counter >= maxModules {
-				log.Printf("Reached maximum number of modules (%d). Stopping.", counter)
+				m := s.lFmt.Sprintf("Reached maximum number of modules (%d). Stopping.", counter)
+				log.Print(m)
 				break // Stop if we reached the maximum number of modules
 			}
 			if len(line) == 0 {
@@ -174,7 +180,8 @@ func (s *Scanner) Start() {
 			break // Stop if we received fewer modules than requested
 		}
 	}
-	log.Printf("Processed %d modules up to %s", counter, since.Format(time.RFC3339))
+	m := s.lFmt.Sprintf("Processed %d modules up to %s", counter, since.Format(time.RFC3339))
+	log.Print(m)
 }
 
 func (s *Scanner) getMostRecentFetchTime() time.Time {
