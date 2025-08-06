@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -28,6 +29,7 @@ type Module struct {
 	Path    string
 	Version string
 	Readme  string
+	Docs    string // Output of 'go doc -all'
 	Time    time.Time
 }
 
@@ -139,7 +141,6 @@ func (s *Scanner) Start() {
 		}
 	}()
 
-	// modules := make(map[string]*ModuleEntry)
 	since := s.getMostRecentFetchTime()
 	urlBase := "https://index.golang.org/index"
 
@@ -221,6 +222,137 @@ func (s *Scanner) getMostRecentFetchTime() time.Time {
 	return t
 }
 
+func (s *Scanner) downloadModule(mod *Module, conn *pgx.Conn) error {
+	url := fmt.Sprintf("https://proxy.golang.org/cached-only/%s/@v/%s.zip", mod.Path, mod.Version)
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to download module %s: %w", mod.Path, err)
+	}
+	defer func() {
+		err = errors.Join(err, resp.Body.Close())
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code for %s: %d", mod.Path, resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body for %s: %w", mod.Path, err)
+	}
+	err = s.parseModule(mod, data) // This function also unzips the module to /tmp
+	if err != nil {
+		return fmt.Errorf("failed to extract content for %s: %w", mod.Path, err)
+	}
+	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), `INSERT INTO mods (path, version, readme, docs, time) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, docs = $4, time = $5 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Docs, mod.Time)
+		return err
+	})
+	if err != nil {
+		log.Printf("length of mod.Readme: %d", len(mod.Readme))
+		return fmt.Errorf("failed to insert module %s into database: %w", mod.Path, err)
+	}
+	return nil
+}
+
+func (s *Scanner) parseModule(mod *Module, data []byte) error {
+	// Create a regexp to match README files
+	readmeRegex := regexp.MustCompile(`(?i)readme(\.md|\.txt)?$`)
+	readmeContents := strings.Builder{}
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return fmt.Errorf("failed to create zip reader: %w", err)
+	}
+
+	tmpDir, err := os.MkdirTemp(s.scratchDir, "mod-")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary directory: %w", err)
+	}
+	defer func() {
+		err = errors.Join(err, os.RemoveAll(tmpDir)) // Clean up the temporary directory after processing
+		if err != nil {
+			log.Printf("Failed to remove temporary directory %s: %v", tmpDir, err)
+		}
+	}()
+
+	for _, file := range reader.File {
+		path := filepath.Join(tmpDir, file.Name)
+		// log.Printf("Processing file: %s", path)
+		if !strings.HasPrefix(path, filepath.Clean(tmpDir)+string(os.PathSeparator)) {
+			fmt.Println("invalid file path")
+			continue
+		}
+		rc, err := file.Open()
+		if err != nil {
+			log.Printf("Failed to open file %s in zip: %v", file.Name, err)
+			continue
+		}
+
+		// Build a single string with all README contents
+		if readmeRegex.MatchString(file.Name) {
+			defer func() {
+				err = errors.Join(err, rc.Close())
+			}()
+			content, err := io.ReadAll(rc)
+			if err != nil {
+				log.Printf("Failed to read content of file %s: %v", file.Name, err)
+				continue
+			}
+			if !utf8.Valid(content) {
+				log.Printf("File %s is not valid UTF-8, skipping", file.Name)
+				continue
+			}
+			readmeContents.Write(content)
+			readmeContents.WriteByte('\n') // Add a newline for separation
+		}
+
+		if file.FileInfo().IsDir() {
+			err := os.MkdirAll(path, os.ModePerm)
+			if err != nil {
+				log.Printf("Failed to create directory %s: %v", path, err)
+				continue
+			}
+		} else {
+			dirPath := filepath.Dir(path)
+			err := os.MkdirAll(dirPath, os.ModePerm)
+			if err != nil {
+				log.Printf("Failed to create directory %s: %v", dirPath, err)
+				continue
+			}
+		}
+
+		// Create the file in the temporary directory
+		dstFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+		if err != nil {
+			log.Printf("Failed to create file %s: %v", file.Name, err)
+			continue
+		}
+		defer func() {
+			err = errors.Join(err, dstFile.Close())
+		}()
+		_, err = io.Copy(dstFile, rc)
+		if err != nil {
+			log.Printf("Failed to copy content of file %s: %v", file.Name, err)
+			continue
+		}
+	}
+	mod.Readme = readmeContents.String() // Set the Readme field to the collected content
+
+	goPath, err := exec.LookPath("go")
+	if err != nil {
+		return fmt.Errorf("failed to find 'go' executable: %w", err)
+	}
+	cmd := exec.Command(goPath, "doc", "-all")                // Run 'go doc' command
+	cmd.Dir = filepath.Join(tmpDir, mod.Path+"@"+mod.Version) // Set the working directory to the temporary directory
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Failed to run 'go doc' command: %v\n%v", err, string(output))
+		// panic("Failed to run 'go doc' command") // Panic if 'go doc' fails
+	} else {
+		mod.Docs = string(output) // Store the output of 'go doc' in mod.Docs
+	}
+
+	return nil
+}
+
 func main() {
 	log.Println("Starting the scanner...")
 	scanner := NewScanner()
@@ -249,6 +381,7 @@ func initDB() (*pgx.Conn, error) {
 		path TEXT NOT NULL UNIQUE,
 		version TEXT NOT NULL,
 		readme TEXT,
+		docs TEXT,
 		time TIMESTAMP);`)
 		if err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
@@ -296,38 +429,6 @@ func getLatestModInfo(path string) (*Info, error) {
 	return &info, nil
 }
 
-func (s *Scanner) downloadModule(mod *Module, conn *pgx.Conn) error {
-	url := fmt.Sprintf("https://proxy.golang.org/cached-only/%s/@v/%s.zip", mod.Path, mod.Version)
-	resp, err := http.Get(url)
-	if err != nil {
-		return fmt.Errorf("failed to download module %s: %w", mod.Path, err)
-	}
-	defer func() {
-		err = errors.Join(err, resp.Body.Close())
-	}()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code for %s: %d", mod.Path, resp.StatusCode)
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body for %s: %w", mod.Path, err)
-	}
-	txt, err := s.extractContent(data) // This function also unzips the module to /tmp
-	if err != nil {
-		return fmt.Errorf("failed to extract content for %s: %w", mod.Path, err)
-	}
-	mod.Readme = txt
-	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(context.Background(), `INSERT INTO mods (path, version, readme, time) VALUES ($1, $2, $3, $4) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, time = $4 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Time)
-		return err
-	})
-	if err != nil {
-		log.Printf("length of mod.Readme: %d", len(mod.Readme))
-		return fmt.Errorf("failed to insert module %s into database: %w", mod.Path, err)
-	}
-	return nil
-}
-
 func latestSeenVersion(path string, conn *pgx.Conn) string {
 	var version string
 	err := conn.QueryRow(context.Background(), "SELECT version FROM mods WHERE path LIKE $1", path).Scan(&version)
@@ -335,91 +436,6 @@ func latestSeenVersion(path string, conn *pgx.Conn) string {
 		return ""
 	}
 	return version
-}
-
-func (s *Scanner) extractContent(data []byte) (string, error) {
-	// Create a regexp to match README files
-	readmeRegex := regexp.MustCompile(`(?i)readme(\.md|\.txt)?$`)
-	readmeContents := strings.Builder{}
-	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		return "", fmt.Errorf("failed to create zip reader: %w", err)
-	}
-	tmpDir, err := os.MkdirTemp(s.scratchDir, "mod-")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temporary directory: %w", err)
-	}
-	defer func() {
-		err = errors.Join(err, os.RemoveAll(tmpDir)) // Clean up the temporary directory after processing
-		if err != nil {
-			log.Printf("Failed to remove temporary directory %s: %v", tmpDir, err)
-		}
-	}()
-
-	for _, file := range reader.File {
-		path := filepath.Join(tmpDir, file.Name)
-		log.Printf("Processing file: %s", path)
-		if !strings.HasPrefix(path, filepath.Clean(tmpDir)+string(os.PathSeparator)) {
-			fmt.Println("invalid file path")
-			continue
-		}
-		if file.FileInfo().IsDir() {
-			fmt.Println("creating directory...")
-			err := os.MkdirAll(path, os.ModePerm)
-			if err != nil {
-				log.Printf("Failed to create directory %s: %v", path, err)
-				continue
-			}
-		} else {
-			dirPath := filepath.Dir(path)
-			err := os.MkdirAll(dirPath, os.ModePerm)
-			if err != nil {
-				log.Printf("Failed to create directory %s: %v", dirPath, err)
-				continue
-			}
-		}
-
-		rc, err := file.Open()
-		if err != nil {
-			log.Printf("Failed to open file %s in zip: %v", file.Name, err)
-			continue
-		}
-		defer func() {
-			err = errors.Join(err, rc.Close())
-		}()
-
-		dstFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
-		if err != nil {
-			log.Printf("Failed to create file %s: %v", file.Name, err)
-			continue
-		}
-		defer func() {
-			err = errors.Join(err, dstFile.Close())
-		}()
-
-		_, err = io.Copy(dstFile, rc)
-		if err != nil {
-			log.Printf("Failed to copy content of file %s: %v", file.Name, err)
-			continue
-		}
-
-		// Build a single string with all README contents
-		if readmeRegex.MatchString(file.Name) {
-			content, err := io.ReadAll(rc)
-			if err != nil {
-				log.Printf("Failed to read content of file %s: %v", file.Name, err)
-				continue
-			}
-			if !utf8.Valid(content) {
-				log.Printf("File %s is not valid UTF-8, skipping", file.Name)
-				continue
-			}
-
-			readmeContents.Write(content)
-			readmeContents.WriteByte('\n') // Add a newline for separation
-		}
-	}
-	return readmeContents.String(), nil
 }
 
 type Info struct {

@@ -14,7 +14,13 @@
     <pre>{{.Readme}}</pre>
     {{else}}
     <p>No README available.</p>
+    {{end}} {{if .Docs}}
+    <h2>Docs</h2>
+    <pre>{{.Docs}}</pre>
+    {{else}}
+    <p>No documentation available.</p>
     {{end}}
+    <h2>Search</h2>
     <form action="/search" method="get">
       <label for="query">Search:</label>
       <input type="text" id="query" name="q" required />

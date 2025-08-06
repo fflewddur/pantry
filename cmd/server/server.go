@@ -93,8 +93,9 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Hit ID=%v, score=%v", *hit.Id, *hit.Score)
 			var path, version string
 			var readme sql.NullString
+			var docs sql.NullString
 			var t time.Time
-			err := s.db.QueryRow(context.Background(), "SELECT path, version, readme, time FROM mods WHERE id = $1", *hit.Id).Scan(&path, &version, &readme, &t)
+			err := s.db.QueryRow(context.Background(), "SELECT path, version, readme, docs, time FROM mods WHERE id = $1", *hit.Id).Scan(&path, &version, &readme, &docs, &t)
 			if err != nil {
 				if err == sql.ErrNoRows {
 					log.Printf("Module with ID %d not found in database", *hit.Id)
@@ -104,12 +105,13 @@ func (s *Server) searchHandler(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 				return
 			}
-			log.Printf("Module found: path=%s, version=%s, readme=%v, time=%s", path, version, readme, t.Format(time.RFC3339))
+			log.Printf("Module found: path=%s, version=%s, time=%s", path, version, t.Format(time.RFC3339))
 			searchResults.Results = append(searchResults.Results, &Module{
 				Id:      *hit.Id,
 				Path:    path,
 				Version: version,
 				Readme:  readme.String,
+				Docs:    docs.String,
 				Time:    t,
 				Score:   *hit.Score,
 			})
@@ -148,6 +150,7 @@ type Module struct {
 	Path    string
 	Version string
 	Readme  string
+	Docs    string
 	Time    time.Time
 	Score   int32
 }
@@ -157,8 +160,9 @@ func (s *Server) modHandler(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path[len("/mod/"):] // Extract the path after /mod/
 	var version string
 	var readme sql.NullString
+	var docs sql.NullString
 	var t time.Time
-	err := s.db.QueryRow(context.Background(), "SELECT version, time, readme FROM mods WHERE path = $1", path).Scan(&version, &t, &readme)
+	err := s.db.QueryRow(context.Background(), "SELECT version, time, readme, docs FROM mods WHERE path = $1", path).Scan(&version, &t, &readme, &docs)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			log.Printf("Module %s not found", path)
@@ -174,6 +178,7 @@ func (s *Server) modHandler(w http.ResponseWriter, r *http.Request) {
 		Path:    path,
 		Version: version,
 		Readme:  readme.String,
+		Docs:    docs.String,
 		Time:    t,
 	}
 	tmpl, err := template.New("mod.html").ParseFiles("templates/mod.html")
@@ -194,16 +199,15 @@ type ModPageData struct {
 	Path    string
 	Version string
 	Readme  string
+	Docs    string
 	Time    time.Time
 }
 
 func initDB() (*pgx.Conn, error) {
-	log.Println("Initializing database connection...")
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		dbURL = "postgresql://pantry:whatever@localhost:26257/pantry"
 	}
-	log.Printf("Using DATABASE_URL: %s", dbURL)
 	config, err := pgx.ParseConfig(dbURL)
 	if err != nil {
 		log.Fatalf("Failed to parse DATABASE_URL: %v", err)
@@ -218,6 +222,7 @@ func initDB() (*pgx.Conn, error) {
 		path TEXT NOT NULL PRIMARY KEY,
 		version TEXT NOT NULL,
 		readme TEXT,
+		docs TEXT,
 		time TIMESTAMP);`)
 		if err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
@@ -227,6 +232,6 @@ func initDB() (*pgx.Conn, error) {
 	if err != nil {
 		log.Fatalf("Failed to create table: %v", err)
 	}
-	log.Println("Database initialized successfully.")
+
 	return conn, nil
 }

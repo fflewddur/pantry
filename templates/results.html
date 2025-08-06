@@ -21,10 +21,10 @@
         <br />
         Last Updated: {{.Time}}
         <br />
-        {{if .Readme}}
-        <p>Has a readme file.</p>
-        {{else}}
-        <p>No README available.</p>
+        {{if .Readme}} Has a readme file.<br />
+        {{else}} No README available.<br />
+        {{end}} {{if .Docs}} Has documentation.<br />
+        {{else}} No documentation available.<br />
         {{end}}
       </li>
       {{end}}
