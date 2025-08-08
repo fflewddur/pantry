@@ -19,7 +19,12 @@ import (
 	"unicode/utf8"
 
 	crdbpgx "github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
+	"github.com/go-enry/go-license-detector/v4/licensedb"
+	"github.com/go-enry/go-license-detector/v4/licensedb/api"
+	"github.com/go-enry/go-license-detector/v4/licensedb/filer"
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/mod/module"
+	modzip "golang.org/x/mod/zip"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 )
@@ -30,6 +35,7 @@ type Module struct {
 	Version string
 	Readme  string
 	Docs    string // Output of 'go doc -all'
+	Desc    string // Description of the module, if available
 	Time    time.Time
 }
 
@@ -57,8 +63,8 @@ func NewScanner() *Scanner {
 	return &Scanner{
 		db:         db,
 		httpClient: &http.Client{},
-		modPaths:   make(chan string, 100),
-		toFetch:    make(chan *Module, 100),
+		modPaths:   make(chan string, 1),
+		toFetch:    make(chan *Module, 1),
 		lFmt:       message.NewPrinter(language.Make(os.Getenv("LANG"))),
 		scratchDir: scratchDir,
 	}
@@ -68,7 +74,7 @@ func (s *Scanner) Start() {
 	defer func() {
 		err := s.db.Close(context.Background())
 		if err != nil {
-			log.Printf("Error closing database connection: %v", err)
+			log.Fatalf("Error closing database connection: %v", err)
 		}
 	}()
 	err := os.MkdirAll(s.scratchDir, os.ModePerm) // Ensure the scratch directory exists
@@ -78,7 +84,7 @@ func (s *Scanner) Start() {
 	defer func() {
 		err = errors.Join(err, os.RemoveAll(s.scratchDir)) // Clean up the scratch directory after processing
 		if err != nil {
-			log.Printf("Failed to remove scratch directory %s: %v", s.scratchDir, err)
+			log.Fatalf("Failed to remove scratch directory %s: %v", s.scratchDir, err)
 		}
 	}()
 	counter := 0
@@ -167,8 +173,7 @@ func (s *Scanner) Start() {
 		emptyLines := 0
 		for _, line := range lines {
 			if counter >= maxModules {
-				m := s.lFmt.Sprintf("Reached maximum number of modules (%d). Stopping.", counter)
-				log.Print(m)
+				log.Print(s.lFmt.Sprintf("Reached maximum number of modules (%d). Stopping.", counter))
 				break // Stop if we reached the maximum number of modules
 			}
 			if len(line) == 0 {
@@ -238,7 +243,7 @@ func (s *Scanner) downloadModule(mod *Module, conn *pgx.Conn) error {
 	if err != nil {
 		return fmt.Errorf("failed to read response body for %s: %w", mod.Path, err)
 	}
-	err = s.parseModule(mod, data) // This function also unzips the module to /tmp
+	_, err = s.parseModule(mod, data) // This function also unzips the module to /tmp
 	if err != nil {
 		return fmt.Errorf("failed to extract content for %s: %w", mod.Path, err)
 	}
@@ -253,18 +258,18 @@ func (s *Scanner) downloadModule(mod *Module, conn *pgx.Conn) error {
 	return nil
 }
 
-func (s *Scanner) parseModule(mod *Module, data []byte) error {
+func (s *Scanner) parseModule(mod *Module, data []byte) (*parseResult, error) {
 	// Create a regexp to match README files
 	readmeRegex := regexp.MustCompile(`(?i)readme(\.md|\.txt)?$`)
 	readmeContents := strings.Builder{}
 	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
-		return fmt.Errorf("failed to create zip reader: %w", err)
+		return nil, fmt.Errorf("failed to create zip reader: %w", err)
 	}
 
 	tmpDir, err := os.MkdirTemp(s.scratchDir, "mod-")
 	if err != nil {
-		return fmt.Errorf("failed to create temporary directory: %w", err)
+		return nil, fmt.Errorf("failed to create temporary directory: %w", err)
 	}
 	defer func() {
 		err = errors.Join(err, os.RemoveAll(tmpDir)) // Clean up the temporary directory after processing
@@ -273,6 +278,24 @@ func (s *Scanner) parseModule(mod *Module, data []byte) error {
 		}
 	}()
 
+	// Save the module bytes to a temporary file
+	zipPath := filepath.Join(tmpDir, "module.zip")
+	err = os.WriteFile(zipPath, data, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to write module zip file %s: %w", zipPath, err)
+	}
+	// Unzip the module contents to the temporary directory
+	mv := module.Version{
+		Path:    mod.Path,
+		Version: mod.Version,
+	}
+	log.Printf("Unzipping module %s version %s to %s", mod.Path, mod.Version, tmpDir)
+	err = modzip.Unzip(filepath.Join(tmpDir, "unzipped"), mv, zipPath) // Unzip the module contents to the temporary directory
+	if err != nil {
+		return nil, fmt.Errorf("failed to unzip module %s: %w", mod.Path, err)
+	}
+
+	// in-memory processing: copy all README files to a single string
 	for _, file := range reader.File {
 		path := filepath.Join(tmpDir, file.Name)
 		// log.Printf("Processing file: %s", path)
@@ -303,54 +326,78 @@ func (s *Scanner) parseModule(mod *Module, data []byte) error {
 			readmeContents.Write(content)
 			readmeContents.WriteByte('\n') // Add a newline for separation
 		}
-
-		if file.FileInfo().IsDir() {
-			err := os.MkdirAll(path, os.ModePerm)
-			if err != nil {
-				log.Printf("Failed to create directory %s: %v", path, err)
-				continue
-			}
-		} else {
-			dirPath := filepath.Dir(path)
-			err := os.MkdirAll(dirPath, os.ModePerm)
-			if err != nil {
-				log.Printf("Failed to create directory %s: %v", dirPath, err)
-				continue
-			}
-		}
-
-		// Create the file in the temporary directory
-		dstFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
-		if err != nil {
-			log.Printf("Failed to create file %s: %v", file.Name, err)
-			continue
-		}
-		defer func() {
-			err = errors.Join(err, dstFile.Close())
-		}()
-		_, err = io.Copy(dstFile, rc)
-		if err != nil {
-			log.Printf("Failed to copy content of file %s: %v", file.Name, err)
-			continue
-		}
 	}
 	mod.Readme = readmeContents.String() // Set the Readme field to the collected content
 
 	goPath, err := exec.LookPath("go")
 	if err != nil {
-		return fmt.Errorf("failed to find 'go' executable: %w", err)
+		return nil, fmt.Errorf("failed to find 'go' executable: %w", err)
 	}
-	cmd := exec.Command(goPath, "doc", "-all")                // Run 'go doc' command
-	cmd.Dir = filepath.Join(tmpDir, mod.Path+"@"+mod.Version) // Set the working directory to the temporary directory
+	cmd := exec.Command(goPath, "doc", "-all")  // Run 'go doc' command
+	cmd.Dir = filepath.Join(tmpDir, "unzipped") // Set the working directory to the temporary directory
+	// log.Printf("cmd.Dir: %s", cmd.Dir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("Failed to run 'go doc' command: %v\n%v", err, string(output))
 		// panic("Failed to run 'go doc' command") // Panic if 'go doc' fails
 	} else {
+		// log.Printf("doc output for module %s:\n%s", mod.Path, string(output))
 		mod.Docs = string(output) // Store the output of 'go doc' in mod.Docs
 	}
 
-	return nil
+	// log.Printf("Detecting licenses from %s...", cmd.Dir)
+	f, err := filer.FromDirectory(cmd.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create filer from directory %s: %w", cmd.Dir, err)
+	}
+	licenses, err := licensedb.Detect(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to detect licenses: %w", err)
+	}
+	// for k, m := range licenses {
+	// 	log.Printf("Detected license for module %s: %.2f, %s, %v (key: %s)", mod.Path, m.Confidence, m.File, m.Files, k)
+	// }
+
+	parseResult := &parseResult{
+		Module:       mod,
+		Licenses:     filterLicenses(licenses),
+		PrimeLicense: primeLicense(licenses),
+	}
+	return parseResult, nil
+}
+
+type parseResult struct {
+	Module       *Module
+	Licenses     []string
+	PrimeLicense string // The license with the highest confidence
+}
+
+const LICENSE_CONFIDENCE_THRESHOLD = 0.9 // Minimum confidence level for a license to be considered
+
+func filterLicenses(licenses map[string]api.Match) []string {
+	// Filter out licenses with confidence less than 0.9
+	var filtered []string
+	for k, m := range licenses {
+		if m.Confidence >= LICENSE_CONFIDENCE_THRESHOLD {
+			filtered = append(filtered, k)
+		}
+	}
+	return filtered
+}
+
+// primeLicense returns the license with the highest confidence from the provided licenses map.
+// If there are no licenses, it returns an empty string.
+func primeLicense(licenses map[string]api.Match) string {
+	// Return the license with the highest confidence
+	var prime string
+	maxConfidence := float32(0.0)
+	for k, m := range licenses {
+		if m.Confidence > LICENSE_CONFIDENCE_THRESHOLD && m.Confidence > maxConfidence {
+			maxConfidence = m.Confidence
+			prime = k
+		}
+	}
+	return prime
 }
 
 func main() {
