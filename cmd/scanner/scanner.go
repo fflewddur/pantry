@@ -105,6 +105,7 @@ func (s *Scanner) Start() {
 			mod := &Module{
 				Path:    "github.com/fflewddur/ltbsky",
 				Version: "v0.3.0",
+				Time:    time.Now(),
 			}
 			s.toFetch <- mod
 			return // Skip processing if we're in end-to-end test mode
@@ -257,7 +258,7 @@ func (s *Scanner) downloadModule(mod *Module, conn *pgx.Conn) error {
 		return fmt.Errorf("failed to extract content for %s: %w", mod.Path, err)
 	}
 	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		err := tx.QueryRow(context.Background(), `INSERT INTO mods (path, version, readme, docs, time) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, docs = $4, time = $5 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Docs, mod.Time).Scan(&mod.Id)
+		_, err := tx.Exec(context.Background(), `INSERT INTO mods (path, version, readme, docs, time) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, docs = $4, time = $5 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Docs, mod.Time) //.Scan(&mod.Id)
 		return err
 	})
 	if err != nil {
@@ -265,12 +266,11 @@ func (s *Scanner) downloadModule(mod *Module, conn *pgx.Conn) error {
 		return fmt.Errorf("failed to insert module %s into database: %w", mod.Path, err)
 	}
 	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(context.Background(), `INSERT INTO modsmeta (id, license, licenses) VALUES ($1, $2, $3) ON CONFLICT (path) DO UPDATE SET license = $2, licenses = $3 WHERE excluded.id = $1;`, mod.Id, pr.PrimeLicense, pr.Licenses)
+		_, err := tx.Exec(context.Background(), `INSERT INTO modsmeta (id, license, licenses) VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET license = $2, licenses = $3 WHERE excluded.id = $1;`, mod.Id, pr.PrimeLicense, pr.Licenses)
 		return err
 	})
 	if err != nil {
-		log.Printf("length of mod.Readme: %d", len(mod.Readme))
-		return fmt.Errorf("failed to insert module %s into database: %w", mod.Path, err)
+		return fmt.Errorf("failed to insert modmeta %s into database: %w", mod.Path, err)
 	}
 	return nil
 }
