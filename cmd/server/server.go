@@ -219,18 +219,32 @@ func initDB() (*pgx.Conn, error) {
 
 	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(context.Background(), `CREATE TABLE IF NOT EXISTS mods (
-		path TEXT NOT NULL PRIMARY KEY,
+		id INT64 DEFAULT unique_rowid(),
+		path TEXT NOT NULL UNIQUE,
 		version TEXT NOT NULL,
 		readme TEXT,
 		docs TEXT,
 		time TIMESTAMP);`)
 		if err != nil {
-			return fmt.Errorf("failed to create table: %w", err)
+			return fmt.Errorf("failed to create mods table: %w", err)
 		}
 		return nil
 	})
 	if err != nil {
-		log.Fatalf("Failed to create table: %v", err)
+		log.Fatalf("Failed to create mods table: %v", err)
+	}
+	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), `CREATE TABLE IF NOT EXISTS modsmeta (
+		id INT64 PRIMARY KEY,
+		license STRING,
+		licenses STRING[]);`)
+		if err != nil {
+			return fmt.Errorf("failed to create modsmeta table: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("Failed to create modsmeta table: %v", err)
 	}
 
 	return conn, nil

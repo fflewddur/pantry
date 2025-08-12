@@ -100,6 +100,15 @@ func (s *Scanner) Start() {
 		defer func() {
 			err = errors.Join(err, conn.Close(context.Background()))
 		}()
+		if os.Getenv("PANTRY_TEST_E2E") != "" {
+			log.Println("PANTRY_TEST_E2E is set, testing fflewddur/ltbsky module...")
+			mod := &Module{
+				Path:    "github.com/fflewddur/ltbsky",
+				Version: "v0.3.0",
+			}
+			s.toFetch <- mod
+			return // Skip processing if we're in end-to-end test mode
+		}
 		seen := make(map[string]bool)
 		for path := range s.modPaths {
 			log.Printf("Processing module path: %s", path)
@@ -243,12 +252,20 @@ func (s *Scanner) downloadModule(mod *Module, conn *pgx.Conn) error {
 	if err != nil {
 		return fmt.Errorf("failed to read response body for %s: %w", mod.Path, err)
 	}
-	_, err = s.parseModule(mod, data) // This function also unzips the module to /tmp
+	pr, err := s.parseModule(mod, data) // This function also unzips the module to /tmp
 	if err != nil {
 		return fmt.Errorf("failed to extract content for %s: %w", mod.Path, err)
 	}
 	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(context.Background(), `INSERT INTO mods (path, version, readme, docs, time) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, docs = $4, time = $5 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Docs, mod.Time)
+		err := tx.QueryRow(context.Background(), `INSERT INTO mods (path, version, readme, docs, time) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, docs = $4, time = $5 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Docs, mod.Time).Scan(&mod.Id)
+		return err
+	})
+	if err != nil {
+		log.Printf("length of mod.Readme: %d", len(mod.Readme))
+		return fmt.Errorf("failed to insert module %s into database: %w", mod.Path, err)
+	}
+	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), `INSERT INTO modsmeta (id, license, licenses) VALUES ($1, $2, $3) ON CONFLICT (path) DO UPDATE SET license = $2, licenses = $3 WHERE excluded.id = $1;`, mod.Id, pr.PrimeLicense, pr.Licenses)
 		return err
 	})
 	if err != nil {
@@ -424,14 +441,27 @@ func initDB() (*pgx.Conn, error) {
 
 	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		_, err := tx.Exec(context.Background(), `CREATE TABLE IF NOT EXISTS mods (
-		id INT64 DEFAULT unique_rowid(),
+		id INT64 PRIMARY KEY DEFAULT unique_rowid(),
 		path TEXT NOT NULL UNIQUE,
 		version TEXT NOT NULL,
 		readme TEXT,
 		docs TEXT,
 		time TIMESTAMP);`)
 		if err != nil {
-			return fmt.Errorf("failed to create table: %w", err)
+			return fmt.Errorf("failed to create mods table: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
+		_, err := tx.Exec(context.Background(), `CREATE TABLE IF NOT EXISTS modsmeta (
+		id INT64 PRIMARY KEY,
+		license STRING,
+		licenses STRING[]);`)
+		if err != nil {
+			return fmt.Errorf("failed to create modsmeta table: %w", err)
 		}
 		return nil
 	})
@@ -443,7 +473,7 @@ func initDB() (*pgx.Conn, error) {
 		key STRING NOT NULL PRIMARY KEY,
 		value STRING);`)
 		if err != nil {
-			return fmt.Errorf("failed to create table: %w", err)
+			return fmt.Errorf("failed to create utils table: %w", err)
 		}
 		return nil
 	})
