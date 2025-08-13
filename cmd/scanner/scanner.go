@@ -258,7 +258,7 @@ func (s *Scanner) downloadModule(mod *Module, conn *pgx.Conn) error {
 		return fmt.Errorf("failed to extract content for %s: %w", mod.Path, err)
 	}
 	err = crdbpgx.ExecuteTx(context.Background(), conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
-		_, err := tx.Exec(context.Background(), `INSERT INTO mods (path, version, readme, docs, time) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, docs = $4, time = $5 WHERE excluded.path LIKE $1;`, mod.Path, mod.Version, mod.Readme, mod.Docs, mod.Time) //.Scan(&mod.Id)
+		err := tx.QueryRow(context.Background(), `INSERT INTO mods (path, version, readme, docs, time) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (path) DO UPDATE SET version = $2, readme = $3, docs = $4, time = $5 WHERE excluded.path LIKE $1 RETURNING id;`, mod.Path, mod.Version, mod.Readme, mod.Docs, mod.Time).Scan(&mod.Id)
 		return err
 	})
 	if err != nil {
@@ -270,7 +270,7 @@ func (s *Scanner) downloadModule(mod *Module, conn *pgx.Conn) error {
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("failed to insert modmeta %s into database: %w", mod.Path, err)
+		return fmt.Errorf("failed to insert module metadata %s into database: %w", mod.Path, err)
 	}
 	return nil
 }
